@@ -584,7 +584,7 @@ for (v in measure_vars) {
          size = "% missing") +
     theme_custom
   
-  ggsave(file.path(prof_out, paste0(v, " 28day.png")), p, width = 9, height = 6)
+  ggsave(file.path(prof_out, paste0(v, " 14day.png")), p, width = 9, height = 6)
 }
 
 # Median and IQR profiles

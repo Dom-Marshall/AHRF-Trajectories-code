@@ -167,7 +167,7 @@ p_pf_iqr <- ggplot() +
 ggsave(file.path(cfg$out_dir %||% ".", "MIMIC_PF_Emp_IQR_vs_Pred_K4.png"),
        p_pf_iqr, width = 10, height = 6, dpi = 300)
 
-# (C) NEW: Predicted PF by class only (solid, coloured)
+# (C) Predictd PF by class only (solid, coloured)
 p_pf_pred_only <- ggplot(pred_df,
                          aes(day_period, value, color = Class, group = Class)) +
   geom_line(linewidth = 1.2) +
