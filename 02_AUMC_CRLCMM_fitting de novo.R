@@ -4,18 +4,18 @@
 # ===============================================================
 
 # ===============================================================
-#   JLMM with competing risks  –  MIMIC-IV  (v2)
-#   *expects:  mimic_pf_daily.csv  &  mimic_stays.csv*
+#   JLMM with competing risks  – AUMC  (v2)
+#   *expects:  aumc_pf_daily.csv  &  aumc_stays.csv*
 # ===============================================================
 
 # -------- CONFIG -----------------------------------------------------------
 cfg <- list(
-  csv_pf           = "mimic_pf_daily.csv",
-  csv_stay         = "mimic_stays.csv",
-  out_dir          = "Results_MIMIC_multiclass_jm_full_14d2",
+  csv_pf           = file.path("Data", "umc_pf_daily.csv"),
+  csv_stay         = file.path("Data", "aumc_stays.csv"),
+  out_dir          = "Results_AUMC_multiclass_jm_full_14d2",
   admin_day        = 14,
-  k_range          = 2:2,
-  rep_starts       = 20,
+  k_range          = 2:4,
+  rep_starts       = 20, # 
   max_iter         = 200,
   parallel_type    = "PSOCK",
   seed_global      = 123
@@ -40,14 +40,34 @@ dir.create(cfg$out_dir, showWarnings = FALSE, recursive = TRUE)
 set.seed(cfg$seed_global)
 
 # -------- 1. LOAD & HARMONISE ----------------------------------------------
-pf_daily <- read.csv(cfg$csv_pf)        # ← has days_from_start already
-stays    <- read.csv(cfg$csv_stay)      # ← stay_id, timezero, outtime, hospital_expire_flag
+pf_daily <- read.csv(cfg$csv_pf)
+stays    <- read.csv(cfg$csv_stay)
 
 parse_datetime <- function(datetime_str) {
   datetime_str <- as.character(datetime_str)
   datetime_str <- trimws(datetime_str)
   datetime_str[datetime_str == ""] <- NA
-  suppressWarnings(as.POSIXct(datetime_str, format = "%d/%m/%Y %H:%M", tz = "UTC"))
+  suppressWarnings(as.POSIXct(
+    datetime_str,
+    tz = "UTC",
+    tryFormats = c(
+      "%Y-%m-%d %H:%M:%OS%z",
+      "%Y-%m-%d %H:%M:%S%z",
+      "%Y-%m-%d %H:%M:%S",
+      "%d/%m/%Y %H:%M"
+    )
+  ))
+}
+
+normalize_pf_to_mmhg <- function(x) {
+  x <- as.numeric(x)
+  med <- suppressWarnings(median(x, na.rm = TRUE))
+  if (is.finite(med) && med <= 80) {
+    message("PF appears to be in kPa; converting to mmHg with factor 7.50062")
+    return(x * 7.50062)
+  }
+  message("PF appears to already be in mmHg; no conversion applied")
+  x
 }
 
 stays$timezero <- parse_datetime(stays$timezero)
@@ -56,10 +76,27 @@ stays$outtime  <- parse_datetime(stays$outtime )
 
 # 1.1 merge & rename so downstream code is 100 % MIMIC-compatible -------------
 raw <- pf_daily %>%
+  {
+    df <- .
+    if (!"day_period" %in% names(df)) {
+      if ("days_from_start" %in% names(df)) {
+        df$day_period <- df$days_from_start
+      } else {
+        stop("Missing day column: expected day_period or days_from_start in pf file")
+      }
+    }
+    if (!"pf_ratio_avg" %in% names(df)) {
+      if ("avg_pf_ratio" %in% names(df)) {
+        df$pf_ratio_avg <- df$avg_pf_ratio
+      } else {
+        stop("Missing PF column: expected pf_ratio_avg or avg_pf_ratio in pf file")
+      }
+    }
+    df
+  } %>%
   mutate(
-    stay_id      = stay_id,                       # keep same name
-    day_period   = days_from_start,               # already integer 0,1,2…
-    pf_ratio_avg = avg_pf_ratio
+    day_period   = as.integer(day_period),
+    pf_ratio_avg = normalize_pf_to_mmhg(pf_ratio_avg)
   ) %>%
   select(stay_id, day_period, pf_ratio_avg)
 
@@ -125,11 +162,11 @@ base_jm <- Jointlcmm(
   na.action  = 1,
   maxiter    = cfg$max_iter
 )
-saveRDS(base_jm, file.path(cfg$out_dir, "mimic_K1_competing.rds"))
+saveRDS(base_jm, file.path(cfg$out_dir, "aumc_K1_competing.rds"))
 
 # 4.1 grid-search for K = 2:5  (identical to MIMIC) --------------------------
 cores <- future::availableCores()
-cl <- if (cfg$parallel_type == "FORK") {
+cl <- if (cfg$parallel_type == "FORK") { # depends if HPC or Windows
   makeCluster(cores, type = "FORK")
 } else {
   makeCluster(max(1, cores - 2), type = "PSOCK")
@@ -163,7 +200,35 @@ for (ng in cfg$k_range) {
   }, error = function(e) { message("gridsearch failed (ng=",ng,"):",e$message); NULL })
 }
 stopCluster(cl)
-saveRDS(joint_models, file.path(cfg$out_dir, "mimic_multiclass_joint_models_full_14d.rds"))
+saveRDS(joint_models, file.path(cfg$out_dir, "aumc_multiclass_joint_models_full_14d.rds"))
+
+for (target_k in sort(unique(cfg$k_range))) {
+  if (is.null(joint_models[[target_k]])) {
+    warning(sprintf("Requested K=%d model did not converge; no dedicated K file written", target_k))
+    next
+  }
+
+  saveRDS(joint_models[[target_k]], file.path(cfg$out_dir, sprintf("aumc_K%d_competing.rds", target_k)))
+
+  k_pprob <- as.data.frame(joint_models[[target_k]]$pprob)
+  write.csv(
+    k_pprob,
+    file.path(cfg$out_dir, sprintf("AUMC_K%d_posterior_probabilities.csv", target_k)),
+    row.names = FALSE
+  )
+
+  post_cols <- grep("^prob", names(k_pprob), value = TRUE)
+  k_class_sizes <- k_pprob %>%
+    mutate(pred_class = max.col(as.matrix(select(., all_of(post_cols))))) %>%
+    count(pred_class, name = "N")
+
+  print(k_class_sizes)
+  write.csv(
+    k_class_sizes,
+    file.path(cfg$out_dir, sprintf("AUMC_K%d_class_sizes.csv", target_k)),
+    row.names = FALSE
+  )
+}
 
 # -------- 5.  DOWNSTREAM PLOTS, TABLES, CIFs -------------------------------
 
@@ -252,7 +317,7 @@ ggsave(
   plot = p, width = 10, height =6
 )
 
-write.csv(fit_stats, file.path(cfg$out_dir, "SummaryTable_MIMIC_CR_14d.csv"), row.names = FALSE)
+write.csv(fit_stats, file.path(cfg$out_dir, "SummaryTable_aumc_CR_14d.csv"), row.names = FALSE)
 
 # ---- Helpers for class mean curves (uses the model's parameterisation) ----
 normalize_class_levels <- function(g, ng) {
@@ -304,7 +369,8 @@ x_breaks <- seq(0, cfg$admin_day, by = 4)
 y_breaks <- c(50, 100, 150, 200, 250, 300, 350)
 
 # ---- Loop over models ----
-for (ng in seq_len(5)) {
+available_k <- sort(unique(c(1, cfg$k_range)))
+for (ng in available_k) {
   tryCatch({
     mdl <- joint_models[[ng]]
     if (is.null(mdl)) {
@@ -332,9 +398,9 @@ for (ng in seq_len(5)) {
                     fill = all_colours[1], alpha = 0.2) +
         geom_line(color = all_colours[1], size = 1) +
         labs(
-          title = sprintf("MIMIC JM PF Trajectories (quad) (ng=%d)", ng),
+          title = sprintf("AUMC JM PF Trajectories (quad) (ng=%d)", ng),
           x     = "Days from Start",
-          y     = "PF Ratio"
+          y     = "PF Ratio (mmHg)"
         ) +
         scale_x_continuous(breaks = x_breaks, limits = c(0, cfg$admin_day)) +
         scale_y_continuous(breaks = y_breaks, limits = c(0, 350)) +
@@ -354,9 +420,9 @@ for (ng in seq_len(5)) {
         geom_line(size = 1) +
         scale_color_manual(values = all_colours[1:ng]) +
         labs(
-          title = sprintf("MIMIC CR PF Trajectories (quad) (ng=%d)", ng),
+          title = sprintf("AUMC CR PF Trajectories (quad) (ng=%d)", ng),
           x     = "Days from Start",
-          y     = "PF Ratio"
+          y     = "PF Ratio (mmHg)"
         ) +
         scale_x_continuous(breaks = x_breaks, limits = c(0, cfg$admin_day)) +
         scale_y_continuous(breaks = y_breaks, limits = c(0, 350)) +
@@ -369,7 +435,7 @@ for (ng in seq_len(5)) {
     ggsave(filename = fname, plot = p, width = 10, height = 7)
     
   }, error = function(e) {
-    message(sprintf("⚠️ Plot failed for ng=%d: %s", ng, e$message))
+    message(sprintf("Plot failed for ng=%d: %s", ng, e$message))
   })
 }
 
@@ -381,9 +447,8 @@ all_colours <- c("deeppink","deepskyblue","forestgreen","orangered","darkorchid"
 x_breaks <- seq(0, cfg$admin_day, by = 4)
 y_breaks <- seq(0, 1, by = 0.2)
 
-#--- Loop over 1:5 -----------------------------------
-
-for (ng in seq_len(5)) {
+#--- Loop over available models -----------------------------------
+for (ng in available_k) {
   tryCatch({
     mdl <- joint_models[[ng]]
     if (is.null(mdl)) next
@@ -436,7 +501,7 @@ for (ng in seq_len(5)) {
       scale_x_continuous(breaks = seq(0,cfg$admin_day,4), limits = c(0,cfg$admin_day)) +
       scale_y_continuous(breaks = seq(0,1,0.2), limits = c(0,1)) +
       labs(
-        title = sprintf("MIMIC AHRF Predicted Survival & Incidence (Classes = %d)", ng),
+        title = sprintf("AUMC AHRF Predicted Survival & Incidence (Classes = %d)", ng),
         x     = "Days from start",
         y     = "Survival / Discharge Incidence"
       ) +
@@ -457,4 +522,4 @@ for (ng in seq_len(5)) {
 }
 
 
-message("MIMIC pipeline complete – outputs in ", cfg$out_dir)
+message("AUMC pipeline complete – outputs in ", cfg$out_dir)
